@@ -1,0 +1,2 @@
+# スクリプトは CRLF で取り出す（PowerShell 5.1 の前提）
+*.ps1 text eol=crlf
