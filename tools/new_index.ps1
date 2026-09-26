@@ -1,19 +1,23 @@
 ﻿# 乱数から、tebunko のインデックス（場所ごとの TSV）と同じ形の性能テスト用データを作る。
 # 形は tebunko の検索の計測に使った合成インデックス（ブック 5.4 万・TSV 16 万・1GB）に合わせる。中身の文字は乱数なので同じにはならない。
-# 作った TSV は、そのまま tebunko のインデックスとして検索を測れる。new_books.ps1 で Excel ブックにもできる。
+# 作った TSV は、tebunko の pack の作成と検索の計測に使う。new_books.ps1 で Excel ブックにもできる。
 #
 #   .\tools\new_index.ps1 -Dest <index のフォルダ>
 #   -Seed 1       … 乱数の種。同じ種・同じ -Scale からは、スレッドの数によらず同じ TSV ができる
 #   -Scale 0.1    … ブックの数を減らす（0.1 で 1 割。大きいブックは常に作る）
-#   -Workers 4    … 並行して作るスレッドの数
+#   -Workers 4    … 並行して書き出すスレッドの数（既定は論理コアの数）
 #
 # <Dest>\部署<0〜51>\年度<0〜9>\資料<番号>.xlsx\シート<1〜5>.tsv と、<Dest>\大きい\乱数.xlsx\シート.tsv を作る。
 # 作成済みのブックは飛ばすため、止めても続きから作れる。
+#
+# 速さのため、行は 1 行ずつ作らない。乱数の行を先に 20 万行作っておき、各シートはその連続した範囲を切り出す。
+# そのため同じ行が複数のシートに出る（読む量・照合する量は変わらないが、乱数の語のヒット件数は偏る）。
+# 件数を決めて測れるよう、計測の語（words.tsv）の「見積書」は、行の文字（漢字 U+4E00〜U+5057・カタカナ）に無い文字で作り、3 冊に 1 回ずつ入れる。
 param (
     [Parameter(Mandatory = $true)][string]$Dest,
     [int]$Seed = 1,
     [double]$Scale = 1.0,
-    [int]$Workers = 4
+    [int]$Workers = [Environment]::ProcessorCount
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,27 +28,80 @@ $Dest = (Resolve-Path -LiteralPath $Dest).ProviderPath.TrimEnd("\")
 $bookCount = [int][Math]::Round(53603 * $Scale)
 $deptCount = 52
 $yearCount = 10
+$poolRows = 200000
+$rareWord = "見積書"
+$rareBooks = 3
 
-# 1 冊を作る処理（スレッドごとに読み込む）
-$worker = {
-    param ($books, $dest, $seed, $progress)
+$watch = [System.Diagnostics.Stopwatch]::StartNew()
+$random = New-Object Random $Seed
+$culture = [System.Globalization.CultureInfo]::InvariantCulture
 
-    $utf8Bom = New-Object System.Text.UTF8Encoding($true)
-    # 文字は漢字（U+4E00〜U+5057）に、カタカナ（U+30A1〜U+30F3）を 4% ほど混ぜる。
-    # 1 セルずつ文字を選ぶと遅いため、乱数の文字の長い列を先に作り、そこから切り出す
-    $poolRandom = New-Object Random $seed
-    $chars = New-Object char[] 1000000
-    for ($i = 0; $i -lt $chars.Length; $i++) {
-        if ($poolRandom.Next(100) -lt 4) {
-            $chars[$i] = [char](0x30A1 + $poolRandom.Next(0x30F3 - 0x30A1 + 1))
+function newCharPool([Random]$r, [int]$length, [int]$first, [int]$last, [int]$kanaPercent) {
+    # 乱数の文字の列。kanaPercent の割合でカタカナ（U+30A1〜U+30F3）を混ぜる
+    $chars = New-Object char[] $length
+    for ($i = 0; $i -lt $length; $i++) {
+        if ($r.Next(100) -lt $kanaPercent) {
+            $chars[$i] = [char](0x30A1 + $r.Next(0x30F3 - 0x30A1 + 1))
         } else {
-            $chars[$i] = [char](0x4E00 + $poolRandom.Next(0x5057 - 0x4E00 + 1))
+            $chars[$i] = [char]($first + $r.Next($last - $first + 1))
         }
     }
-    $pool = New-Object string (, $chars)
-    $poolMax = $pool.Length - 10
-    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    return New-Object string (, $chars)
+}
 
+# 行の列（5 列: 整数、漢字 0〜8 文字、漢字 0〜4 文字、桁区切りの数値、〜の〜）と、各行の先頭の位置
+$chars = newCharPool $random 20000 0x4E00 0x5057 4
+$charMax = $chars.Length - 10
+$sb = New-Object System.Text.StringBuilder ($poolRows * 40)
+$starts = New-Object int[] ($poolRows + 1)
+for ($row = 0; $row -lt $poolRows; $row++) {
+    $starts[$row] = $sb.Length
+    $len2 = if ($random.Next(1000) -lt 46) { 0 } else { 1 + $random.Next(8) }
+    [void]$sb.Append($random.Next(100000)).Append("`t").
+        Append($chars, $random.Next($charMax), $len2).Append("`t").
+        Append($chars, $random.Next($charMax), $random.Next(5)).Append("`t`"").
+        Append((1000 + $random.Next(999000)).ToString("#,##0", $culture)).Append("`"`t").
+        Append($chars, $random.Next($charMax), $random.Next(5)).Append("の").
+        Append($chars, $random.Next($charMax), $random.Next(5)).Append("`r`n")
+}
+$starts[$poolRows] = $sb.Length
+$rowText = $sb.ToString()
+$sb = $null
+Write-Host ("行の列 {0:N0} 行を作りました（{1:N1} 秒）。" -f $poolRows, $watch.Elapsed.TotalSeconds)
+
+# ブックの番号をフォルダ（部署 × 年度）にばらまく。まれな語を入れるブックも決める
+$books = New-Object System.Collections.Generic.List[object]
+for ($n = 0; $n -lt $bookCount; $n++) {
+    $folder = "部署$($random.Next($deptCount))\年度$($random.Next($yearCount))"
+    $books.Add(@{ Number = $n; RelPath = "$folder\資料$n.xlsx"; Rare = $false })
+}
+$marked = 0
+while ($marked -lt [Math]::Min($rareBooks, $books.Count)) {
+    $book = $books[$random.Next($books.Count)]
+    if (!$book.Rare) { $book.Rare = $true; $marked++ }
+}
+$rareLine = "0`t$rareWord`t`t`"1,000`"`tの`r`n"
+
+# 大きいブック（1 列 × 70,003 行。1 行 50 文字の漢字）。文字の切れ端をつなぎ、50 文字ごとに改行する
+$bigDir = Join-Path $Dest "大きい\乱数.xlsx"
+if (![System.IO.Directory]::Exists($bigDir)) {
+    $bigChars = newCharPool $random 20000 0x4E00 0x9FA5 0
+    $big = New-Object System.Text.StringBuilder (70003 * 52)
+    while ($big.Length -lt 70003 * 50) {
+        [void]$big.Append($bigChars, $random.Next($bigChars.Length - 1000), 1000)
+    }
+    $bigText = [regex]::Replace($big.ToString(0, 70003 * 50), '(.{50})', "`$1`r`n")
+    [void][System.IO.Directory]::CreateDirectory("$bigDir.tmp")
+    [System.IO.File]::WriteAllText("$bigDir.tmp\シート.tsv", $bigText, (New-Object System.Text.UTF8Encoding($true)))
+    [System.IO.Directory]::Move("$bigDir.tmp", $bigDir)
+}
+Write-Host ("ブック {0:N0} 冊を書き出します。" -f $books.Count)
+
+# 1 冊を書き出す処理（スレッドごとに読み込む）。行の列から切り出して書くだけにし、PowerShell の処理を少なくする
+$worker = {
+    param ($books, $dest, $seed, $rowText, $starts, $poolRows, $rareLine, $progress)
+
+    $utf8Bom = New-Object System.Text.UTF8Encoding($true)
     foreach ($book in $books) {
         $bookDir = Join-Path $dest $book.RelPath
         if ([System.IO.Directory]::Exists($bookDir)) {
@@ -61,19 +118,10 @@ $worker = {
             for ($s = 1; $s -le $sheetCount; $s++) {
                 $u = $r.NextDouble()
                 $rows = 20 + [int][Math]::Floor(300 * $u * $u)
-                $sb = New-Object System.Text.StringBuilder ($rows * 64)
-                for ($row = 0; $row -lt $rows; $row++) {
-                    $len2 = if ($r.Next(1000) -lt 46) { 0 } else { 1 + $r.Next(8) }
-                    $pre = $r.Next(5)
-                    $post = $r.Next(5)
-                    [void]$sb.Append($r.Next(100000)).Append("`t").
-                        Append($pool, $r.Next($poolMax), $len2).Append("`t").
-                        Append($pool, $r.Next($poolMax), $r.Next(5)).Append("`t`"").
-                        Append((1000 + $r.Next(999000)).ToString("#,##0", $culture)).Append("`"`t").
-                        Append($pool, $r.Next($poolMax), $pre).Append("の").
-                        Append($pool, $r.Next($poolMax), $post).Append("`r`n")
-                }
-                [System.IO.File]::WriteAllText("$tmpDir\シート$s.tsv", $sb.ToString(), $utf8Bom)
+                $first = $r.Next($poolRows - $rows)
+                $text = $rowText.Substring($starts[$first], $starts[$first + $rows] - $starts[$first])
+                if ($book.Rare -and $s -eq 1) { $text = $rareLine + $text }
+                [System.IO.File]::WriteAllText("$tmpDir\シート$s.tsv", $text, $utf8Bom)
             }
             [System.IO.Directory]::Move($tmpDir, $bookDir)
             [void]$progress.Done.Add($book.RelPath)
@@ -81,32 +129,6 @@ $worker = {
             [void]$progress.Failed.Add("$($book.RelPath): $($_.Exception.Message)")
         }
     }
-}
-
-$watch = [System.Diagnostics.Stopwatch]::StartNew()
-
-# ブックの番号をフォルダ（部署 × 年度）にばらまく
-$random = New-Object Random $Seed
-$books = New-Object System.Collections.Generic.List[object]
-for ($n = 0; $n -lt $bookCount; $n++) {
-    $folder = "部署$($random.Next($deptCount))\年度$($random.Next($yearCount))"
-    $books.Add(@{ Number = $n; RelPath = "$folder\資料$n.xlsx" })
-}
-Write-Host ("ブック {0:N0} 冊と大きいブック 1 冊を作ります。" -f $books.Count)
-
-# 大きいブック（1 列 × 70,003 行。1 行 50 文字の漢字）
-$bigDir = Join-Path $Dest "大きい\乱数.xlsx"
-if (![System.IO.Directory]::Exists($bigDir)) {
-    $r = New-Object Random ($Seed * 1000003 - 1)
-    $sb = New-Object System.Text.StringBuilder (70003 * 52)
-    $line = New-Object char[] 50
-    for ($row = 0; $row -lt 70003; $row++) {
-        for ($i = 0; $i -lt 50; $i++) { $line[$i] = [char](0x4E00 + $r.Next(0x9FA5 - 0x4E00 + 1)) }
-        [void]$sb.Append($line).Append("`r`n")
-    }
-    [void][System.IO.Directory]::CreateDirectory("$bigDir.tmp")
-    [System.IO.File]::WriteAllText("$bigDir.tmp\シート.tsv", $sb.ToString(), (New-Object System.Text.UTF8Encoding($true)))
-    [System.IO.Directory]::Move("$bigDir.tmp", $bigDir)
 }
 
 $progress = [hashtable]::Synchronized(@{
@@ -120,7 +142,7 @@ $jobs = foreach ($k in 0..($Workers - 1)) {
     $part = @(for ($i = $k; $i -lt $books.Count; $i += $Workers) { $books[$i] })
     $ps = [powershell]::Create()
     $ps.RunspacePool = $pool
-    [void]$ps.AddScript($worker).AddArgument($part).AddArgument($Dest).AddArgument($Seed).AddArgument($progress)
+    [void]$ps.AddScript($worker).AddArgument($part).AddArgument($Dest).AddArgument($Seed).AddArgument($rowText).AddArgument($starts).AddArgument($poolRows).AddArgument($rareLine).AddArgument($progress)
     @{ PowerShell = $ps; Handle = $ps.BeginInvoke() }
 }
 while (@($jobs | Where-Object { !$_.Handle.IsCompleted }).Count -gt 0) {
