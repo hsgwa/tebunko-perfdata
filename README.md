@@ -1,6 +1,6 @@
 # tebunko-perfdata
 
-[tebunko](https://github.com/hsgwa/tebunko) の性能テストに使う、大量のデータ（インデックスの形の TSV と Excel ブック）を作る道具。本体のリポジトリとは分けて置く。
+[tebunko](https://github.com/hsgwa/tebunko) の性能テストに使う大量のデータ（インデックスの形の TSV と Excel ブック）を生成するスクリプト集。本体とは別のリポジトリにしている。
 
 データは git に入れない（TSV で約 1GB、ブックで約 850MB になるため）。このリポジトリには、データを作るスクリプトと、計測で検索する語の表（`words.tsv`）だけを置く。
 
